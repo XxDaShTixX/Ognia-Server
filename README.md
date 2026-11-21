@@ -21,14 +21,14 @@ ASP.NET Core backend API for [Ognia-WPF](https://github.com/XxDaShTixX/Ognia-WPF
 
 ```
 +----------------+   HTTPS/JSON   +------------------+
-|  WPF (client)  | <------------> |  ASP.NET Core    |
-|                |  JWT bearer    |  (Server)       |
+|  Ognia-WPF     | <------------> |  Ognia-Server    |
+|  (client)      |  JWT bearer    |  (this repo)     |
 +----------------+                +------------------+
-											|
-											v
-									SQLite database
-									(users, playlists,
-									tracks, tokens)
+                                           |
+                                           v
+                                    SQLite database
+                                    (users, playlists,
+                                     tracks, tokens)
 ```
 
 The server owns user identities, playlists, and track metadata. It **never** downloads, stores, or streams audio bytes — when a user adds a track URL, `Ognia-Server` resolves and stores its metadata (`SourceName`, `SourceId`, title, duration, thumbnail), and `Ognia-WPF` downloads the audio directly to the user's machine.
