@@ -1,7 +1,7 @@
 # 🔥 Ognia-Server
 
 <p align="center">
-  <img src="/Assets/Brand/Logo/Ognia.png" alt="Ognia logo" width="200"/>
+  <img src="Server/Assets/Brand/Logo/Ognia.png" alt="Ognia Logo" width="200"/>
 </p>
 
 ASP.NET Core backend API for [Ognia-WPF](https://github.com/XxDaShTixX/Ognia-WPF). Handles user accounts, playlist syncing, and track metadata lookups while leaving all audio downloading and playback to the client.
