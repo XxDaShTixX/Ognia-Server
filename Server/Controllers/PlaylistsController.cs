@@ -17,6 +17,7 @@ namespace Ognia.Server.Controllers
     {
         private readonly AppDbContext _db;
         private readonly ITrackSourceService _trackSource;
+        private enum AddOutcome { Added, Skipped, Invalid }
 
         public PlaylistsController(
             AppDbContext db, 
@@ -360,6 +361,176 @@ namespace Ognia.Server.Controllers
                 Duration = track.Duration,
                 Position = nextPosition
             });
+        }
+
+        /// <summary>
+        /// Adds many track URLs to a playlist in one transaction, preserving request order.
+        /// Every input URL lands in exactly one of Added / Skipped / Invalid.
+        /// </summary>
+        [HttpPost("{id:int}/tracks/bulk")]
+        public async Task<IActionResult> AddTracksBulk(int id, [FromBody] BulkAddTracksRequest request)
+        {
+            if (request?.Urls == null || request.Urls.Count == 0)
+                return BadRequest(new { message = "Urls is required and must not be empty." });
+
+            var userId = User.GetUserId();
+
+            var playlistExists = await _db.Playlists
+                .AnyAsync(p => p.Id == id && p.UserId == userId);
+            if (!playlistExists) return NotFound();
+
+            var response = new BulkAddTracksResponse();
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+            try
+            {
+                var nextPosition = (await _db.PlaylistTracks
+                    .Where(pt => pt.PlaylistId == id)
+                    .MaxAsync(pt => (int?)pt.Position) ?? -1) + 1;
+
+                foreach (var item in request.Urls)
+                {
+                    var (outcome, newPos) = await TryAddOneAsync(id, item, nextPosition);
+                    nextPosition = newPos;
+                    switch (outcome)
+                    {
+                        case AddOutcome.Added: response.Added.Add(item.Url); break;
+                        case AddOutcome.Skipped: response.Skipped.Add(item.Url); break;
+                        default: response.Invalid.Add(item.Url); break;
+                    }
+                }
+
+                await _db.SaveChangesAsync();
+                await tx.CommitAsync();
+            }
+            catch
+            {
+                await tx.RollbackAsync();
+                throw;
+            }
+
+            return Ok(response);
+        }
+
+        /// <summary>
+        /// Adds a single item to the playlist using the same rules as the single-add endpoint.
+        /// If item.Name + item.Duration + item.ThumbnailUrl are supplied, no metadata fetch
+        /// occurs for the item itself (playlist expansions still fetch per video).
+        /// Returns the outcome plus the next free position.
+        /// </summary>
+        private async Task<(AddOutcome Outcome, int NextPosition)> TryAddOneAsync(
+            int playlistId, BulkAddTrackItem item, int nextPosition)
+        {
+            var url = item.Url;
+            if (string.IsNullOrWhiteSpace(url)) return (AddOutcome.Invalid, nextPosition);
+            if (!_trackSource.CanHandle(url)) return (AddOutcome.Invalid, nextPosition);
+
+            // Playlist URL path — expansion is server-side and per-video metadata is not
+            // supplied by the client (client can only pre-fill single-track entries).
+            if (_trackSource.IsPlaylistUrl(url))
+            {
+                var expanded = await _trackSource.ExpandPlaylistAsync(url);
+                if (expanded == null || expanded.Count == 0) return (AddOutcome.Invalid, nextPosition);
+
+                var anyAdded = false;
+                var pos = nextPosition;
+                foreach (var videoUrl in expanded)
+                {
+                    var sid = _trackSource.ExtractId(videoUrl);
+                    if (string.IsNullOrWhiteSpace(sid)) continue;
+
+                    var (outcome, newPos) = await TryUpsertAndLinkAsync(
+                        playlistId, sid, pos,
+                        suppliedName: null, suppliedDuration: null, suppliedThumbnail: null);
+                    pos = newPos;
+                    if (outcome == AddOutcome.Added) anyAdded = true;
+                }
+
+                return (anyAdded ? AddOutcome.Added : AddOutcome.Skipped, pos);
+            }
+
+            // Single-track path
+            var sourceId = _trackSource.ExtractId(url);
+            if (string.IsNullOrWhiteSpace(sourceId)) return (AddOutcome.Invalid, nextPosition);
+
+            return await TryUpsertAndLinkAsync(
+                playlistId, sourceId, nextPosition,
+                suppliedName: item.Name,
+                suppliedDuration: item.Duration,
+                suppliedThumbnail: item.ThumbnailUrl);
+        }
+
+        /// <summary>
+        /// Core per-video-id logic. Uses supplied metadata when all of name+duration+thumbnail
+        /// are present; otherwise fetches from the source. Does not call SaveChanges
+        /// (except when a brand-new TrackModel needs an Id before linking).
+        /// </summary>
+        private async Task<(AddOutcome Outcome, int NextPosition)> TryUpsertAndLinkAsync(
+            int playlistId, string sourceId, int nextPosition,
+            string? suppliedName, TimeSpan? suppliedDuration, string? suppliedThumbnail)
+        {
+            var sourceName = _trackSource.SourceType.ToWireName();
+            var track = await _db.Tracks
+                .FirstOrDefaultAsync(t => t.SourceName == sourceName && t.SourceId == sourceId);
+
+            if (track == null)
+            {
+                string name;
+                string thumbnail;
+                TimeSpan duration;
+
+                var haveAll = !string.IsNullOrWhiteSpace(suppliedName)
+                              && suppliedDuration.HasValue
+                              && suppliedThumbnail != null;
+
+                if (haveAll)
+                {
+                    name = suppliedName!.Trim();
+                    duration = suppliedDuration!.Value;
+                    thumbnail = suppliedThumbnail!;
+                }
+                else
+                {
+                    TrackMetadataModel metadata;
+                    try
+                    {
+                        metadata = await _trackSource.FetchMetadataAsync(sourceId);
+                    }
+                    catch
+                    {
+                        return (AddOutcome.Invalid, nextPosition);
+                    }
+                    name = metadata.Name;
+                    duration = metadata.Duration;
+                    thumbnail = metadata.ThumbnailUrl;
+                }
+
+                track = new TrackModel
+                {
+                    SourceName = _trackSource.SourceName,
+                    SourceId = sourceId,
+                    Name = name,
+                    ThumbnailUrl = thumbnail,
+                    Duration = duration
+                };
+                _db.Tracks.Add(track);
+                await _db.SaveChangesAsync();
+            }
+
+            var alreadyLinked = await _db.PlaylistTracks
+                .AnyAsync(pt => pt.PlaylistId == playlistId && pt.TrackId == track.Id);
+            if (alreadyLinked) return (AddOutcome.Skipped, nextPosition);
+
+            track.Name = await GetUniqueTrackNameAsync(playlistId, track.Name);
+
+            _db.PlaylistTracks.Add(new PlaylistTrackModel
+            {
+                PlaylistId = playlistId,
+                TrackId = track.Id,
+                Position = nextPosition
+            });
+
+            return (AddOutcome.Added, nextPosition + 1);
         }
 
         /// <summary>

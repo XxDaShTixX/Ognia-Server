@@ -89,6 +89,13 @@ builder.Services.AddAuthorization();
 // Build the application
 var app = builder.Build();
 
+// Apply pending migrations (creates DB and tables if missing)
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    db.Database.Migrate();
+}
+
 // Enable Swagger/OpenAPI in development environment
 if (app.Environment.IsDevelopment())
 {
